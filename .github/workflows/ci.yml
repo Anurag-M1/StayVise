@@ -1,0 +1,282 @@
+name: StayVise CI
+on:
+  push:
+    branches: [main, staging]
+  pull_request:
+    branches: [main]
+
+env:
+  PYTHON_VERSION: "3.12"
+  NODE_VERSION: "20"
+
+jobs:
+
+  # ─── BACKEND TESTS ───────────────────────────────────────────────
+  backend-test:
+    name: Backend — Tests + Security
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_DB: stayvise_test
+          POSTGRES_USER: test
+          POSTGRES_PASSWORD: test
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports: ["5432:5432"]
+      redis:
+        image: redis:7-alpine
+        options: --health-cmd "redis-cli ping" --health-retries 5
+        ports: ["6379:6379"]
+    
+    steps:
+      - uses: actions/checkout@v4
+      
+      - uses: actions/setup-python@v5
+        with: { python-version: "${{ env.PYTHON_VERSION }}" }
+      
+      - name: Install uv
+        run: pip install uv
+      
+      - name: Install dependencies
+        run: uv sync --frozen
+        working-directory: backend
+      
+      - name: Run Alembic migrations on test DB
+        run: uv run alembic upgrade head
+        working-directory: backend
+        env:
+          DATABASE_URL: postgresql+asyncpg://test:test@localhost:5432/stayvise_test
+      
+      - name: Run unit tests
+        run: |
+          uv run pytest tests/ \
+            --ignore=tests/load \
+            --ignore=tests/security/test_pentest.py \
+            -v --tb=short \
+            --cov=app \
+            --cov-report=xml \
+            --cov-fail-under=80
+        working-directory: backend
+        env:
+          DATABASE_URL: postgresql+asyncpg://test:test@localhost:5432/stayvise_test
+          REDIS_URL: redis://localhost:6379/0
+          SECRET_KEY: "test-secret-key-minimum-32-bytes-long!!"
+          RAZORPAY_KEY_ID: ${{ secrets.RAZORPAY_TEST_KEY_ID }}
+          RAZORPAY_KEY_SECRET: ${{ secrets.RAZORPAY_TEST_KEY_SECRET }}
+          WHATSAPP_ACCESS_TOKEN: "test_token"
+          WHATSAPP_PHONE_NUMBER_ID: "test_phone_id"
+          WHATSAPP_VERIFY_TOKEN: "test_verify_token"
+          ENVIRONMENT: "test"
+      
+      - name: Upload coverage
+        uses: codecov/codecov-action@v4
+        with: { files: backend/coverage.xml, token: ${{ secrets.CODECOV_TOKEN }} }
+      
+      - name: Security — dependency audit
+        run: |
+          pip install pip-audit safety
+          pip-audit --requirement <(uv export --no-hashes) --format json > audit.json
+          python -c "
+          import json; data = json.load(open('audit.json'))
+          highs = [v for v in data.get('vulnerabilities',[]) if v.get('severity') in ['HIGH','CRITICAL']]
+          if highs:
+            print('HIGH/CRITICAL vulnerabilities found:')
+            for v in highs: print(f'  {v[\"name\"]}: {v[\"description\"]}')
+            exit(1)
+          print('No HIGH/CRITICAL vulnerabilities found')
+          "
+        working-directory: backend
+      
+      - name: Security — static analysis (bandit)
+        run: |
+          pip install bandit
+          bandit -r app/ -ll -f json -o bandit_report.json || true
+          python -c "
+          import json; data = json.load(open('bandit_report.json'))
+          highs = [r for r in data['results'] if r['issue_severity'] in ['HIGH','MEDIUM']]
+          if highs:
+            for h in highs: print(f'SECURITY: {h[\"issue_text\"]} at {h[\"filename\"]}:{h[\"line_number\"]}')
+            exit(1)
+          "
+        working-directory: backend
+      
+      - name: Security — no secrets in code
+        run: |
+          pip install detect-secrets
+          if [ -f .secrets.baseline ]; then
+            detect-secrets scan --baseline .secrets.baseline .
+            detect-secrets audit .secrets.baseline
+          else
+            detect-secrets scan .
+          fi
+        working-directory: backend
+
+  # ─── FRONTEND TESTS ──────────────────────────────────────────────
+  frontend-test:
+    name: Frontend — Tests + Lighthouse
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: "${{ env.NODE_VERSION }}", cache: 'npm' }
+      
+      - name: Install dependencies
+        run: npm ci
+        working-directory: frontend
+      
+      - name: TypeScript check
+        run: npx tsc --noEmit
+        working-directory: frontend
+      
+      - name: ESLint (zero warnings allowed)
+        run: npx eslint src/ --max-warnings=0
+        working-directory: frontend
+      
+      - name: Unit tests
+        run: npm test -- --run   # Assuming vitest is configured under 'test' script
+        working-directory: frontend
+      
+      - name: Build production bundle
+        run: npm run build
+        working-directory: frontend
+        env:
+          VITE_API_URL: https://staging.stayvise.in
+      
+      - name: Bundle size check
+        run: |
+          node -e "
+          const fs = require('fs');
+          const path = require('path');
+          const distDir = './dist/assets';
+          if (!fs.existsSync(distDir)) { console.error('dist/assets not found'); process.exit(1); }
+          const files = fs.readdirSync(distDir);
+          let totalJS = 0;
+          files.filter(f => f.endsWith('.js')).forEach(f => {
+            const size = fs.statSync(path.join(distDir, f)).size;
+            totalJS += size;
+            console.log(f + ': ' + (size/1024).toFixed(1) + 'KB');
+          });
+          const totalKB = totalJS / 1024;
+          console.log('Total JS: ' + totalKB.toFixed(1) + 'KB');
+          if(totalKB > 500) { console.error('FAIL: Bundle > 500KB'); process.exit(1); }
+          if(totalKB > 300) { console.warn('WARN: Bundle > 300KB, consider splitting'); }
+          "
+        working-directory: frontend
+
+  # ─── INTEGRATION TESTS ───────────────────────────────────────────
+  integration-test:
+    name: Integration — API + DB + Celery
+    needs: [backend-test, frontend-test]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Start full stack
+        run: docker-compose -f docker-compose.test.yml up -d --wait
+      
+      - name: Wait for services
+        run: |
+          timeout 60 sh -c 'until curl -sf http://localhost:8000/health; do sleep 2; done'
+      
+      - name: Run integration tests
+        run: |
+          docker-compose -f docker-compose.test.yml exec -T backend \
+            uv run pytest tests/integration/ -v --tb=short
+      
+      - name: Cleanup
+        if: always()
+        run: docker-compose -f docker-compose.test.yml down -v
+
+  # ─── DEPLOY TO STAGING ───────────────────────────────────────────
+  deploy-staging:
+    name: Deploy to staging
+    needs: [integration-test]
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/staging'
+    environment: staging
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Railway CLI
+        run: npm install -g @railway/cli
+      - name: Deploy to Railway staging
+        run: railway up --environment staging
+        env:
+          RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN_STAGING }}
+      
+      - name: Run smoke tests against staging
+        run: |
+          bash tests/smoke/run_smoke_tests.sh https://staging.stayvise.in
+      
+      - name: Lighthouse CI against staging
+        run: |
+          npm install -g @lhci/cli
+          lhci autorun \
+            --collect.url=https://staging.stayvise.in \
+            --assert.preset=lighthouse:recommended \
+            --assert.assertions.performance=["error",{"minScore":0.9}]
+
+  # ─── DEPLOY TO PRODUCTION ────────────────────────────────────────
+  deploy-production:
+    name: Deploy to production
+    needs: [integration-test]
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    environment: production  # requires manual approval via GitHub Environment
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "${{ env.PYTHON_VERSION }}" }
+      
+      - name: Install dependencies for pre-deploy check
+        run: |
+          pip install sqlalchemy asyncpg pydantic-settings
+          # We might need the app context if the script imports from app
+          pip install -e backend/
+      
+      - name: Pre-deploy DB check
+        run: |
+          python backend/scripts/pre_deploy_check.py
+        env:
+          DATABASE_URL: ${{ secrets.PROD_DATABASE_URL_READONLY }}
+      
+      - name: Install Railway CLI
+        run: npm install -g @railway/cli
+      
+      - name: Deploy backend to Railway
+        run: railway up --environment production
+        env:
+          RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN_PROD }}
+      
+      - name: Run migrations
+        run: railway run --environment production alembic upgrade head
+        env:
+          RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN_PROD }}
+      
+      - name: Install Vercel CLI
+        run: npm install -g vercel
+      
+      - name: Deploy frontend to Vercel
+        run: vercel --prod --token ${{ secrets.VERCEL_TOKEN }} --yes
+        working-directory: frontend
+      
+      - name: Post-deploy smoke test (2 min cooldown)
+        run: |
+          sleep 120
+          bash tests/smoke/run_smoke_tests.sh https://stayvise.in
+      
+      - name: Notify team on success
+        if: success()
+        run: |
+          curl -s "https://api.whatsapp.com/send" \
+            -d "to=${{ secrets.ADMIN_PHONE }}&message=Deploy+SUCCESS+%F0%9F%9A%80+StayVise+v${GITHUB_SHA::7}+is+live"
+      
+      - name: Notify team on failure + auto rollback
+        if: failure()
+        run: |
+          railway rollback --environment production
+          curl -s "https://api.whatsapp.com/send" \
+            -d "to=${{ secrets.ADMIN_PHONE }}&message=DEPLOY+FAILED+%26+ROLLED+BACK+%E2%9A%A0%EF%B8%8F+Check+GitHub+Actions"

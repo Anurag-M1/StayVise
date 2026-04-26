@@ -1,0 +1,205 @@
+# StayVise — Docker Compose (local development)
+# All services have healthchecks so dependent services wait properly.
+#
+# Usage:
+#   docker compose up          # start everything
+#   docker compose up backend  # start only backend + its deps
+#   docker compose logs -f backend
+
+name: stayvise
+
+x-common-env: &common-env
+  PYTHONDONTWRITEBYTECODE: "1"
+  PYTHONUNBUFFERED: "1"
+
+services:
+
+  # ── PostgreSQL 16 with pgvector ─────────────────────────────────────────────
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: stayvise_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: stayvise
+      POSTGRES_USER: stayvise
+      POSTGRES_PASSWORD: stayvise_dev_password
+      PGDATA: /var/lib/postgresql/data/pgdata
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./infra/postgres/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U stayvise -d stayvise"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    networks:
+      - stayvise_net
+
+  # ── Redis 7 ────────────────────────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    container_name: stayvise_redis
+    restart: unless-stopped
+    command: >
+      redis-server
+        --maxmemory 256mb
+        --maxmemory-policy allkeys-lru
+        --appendonly yes
+        --appendfsync everysec
+    volumes:
+      - redis_data:/data
+    # ports:
+    #   - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+    networks:
+      - stayvise_net
+
+  # ── FastAPI backend (hot-reload via watchfiles) ────────────────────────────
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+      target: development
+    container_name: stayvise_backend
+    restart: unless-stopped
+    environment:
+      <<: *common-env
+      DATABASE_URL: postgresql+asyncpg://stayvise:stayvise_dev_password@postgres:5432/stayvise
+      REDIS_URL: redis://redis:6379/0
+    env_file:
+      - .env
+    volumes:
+      - ./backend:/app
+      # Exclude the venv from being overwritten by the host mount
+      - backend_venv:/app/.venv
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    command: >
+      uvicorn app.main:app
+        --host 0.0.0.0
+        --port 8000
+        --reload
+        --reload-dir /app/app
+        --log-level info
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/health')\" || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+    networks:
+      - stayvise_net
+
+  # ── Celery worker ──────────────────────────────────────────────────────────
+  celery_worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+      target: development
+    container_name: stayvise_celery
+    restart: unless-stopped
+    environment:
+      <<: *common-env
+      DATABASE_URL: postgresql+asyncpg://stayvise:stayvise_dev_password@postgres:5432/stayvise
+      REDIS_URL: redis://redis:6379/0
+    env_file:
+      - .env
+    volumes:
+      - ./backend:/app
+      - backend_venv:/app/.venv
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    command: >
+      celery -A app.worker.celery_app worker
+        --loglevel=info
+        --concurrency=2
+        --queues=default,high_priority
+    networks:
+      - stayvise_net
+
+  # ── Celery beat (scheduler) ────────────────────────────────────────────────
+  celery_beat:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+      target: development
+    container_name: stayvise_beat
+    restart: unless-stopped
+    environment:
+      <<: *common-env
+      DATABASE_URL: postgresql+asyncpg://stayvise:stayvise_dev_password@postgres:5432/stayvise
+      REDIS_URL: redis://redis:6379/0
+    env_file:
+      - .env
+    volumes:
+      - ./backend:/app
+      - backend_venv:/app/.venv
+    depends_on:
+      redis:
+        condition: service_healthy
+    command: >
+      celery -A app.worker.celery_app beat
+        --loglevel=info
+        --scheduler celery.beat:PersistentScheduler
+    networks:
+      - stayvise_net
+
+  # ── React + Vite frontend ──────────────────────────────────────────────────
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      target: development
+    container_name: stayvise_frontend
+    restart: unless-stopped
+    environment:
+      VITE_API_BASE_URL: http://localhost:8000/api/v1
+      VITE_WS_URL: ws://localhost:8000/ws
+    volumes:
+      - ./frontend:/app
+      - frontend_node_modules:/app/node_modules
+    ports:
+      - "5173:5173"
+    depends_on:
+      - backend
+    command: npm run dev -- --host 0.0.0.0 --port 5173
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:5173 || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    networks:
+      - stayvise_net
+
+# ── Volumes ────────────────────────────────────────────────────────────────────
+volumes:
+  postgres_data:
+    driver: local
+  redis_data:
+    driver: local
+  backend_venv:
+    driver: local
+  frontend_node_modules:
+    driver: local
+
+# ── Network ────────────────────────────────────────────────────────────────────
+networks:
+  stayvise_net:
+    driver: bridge

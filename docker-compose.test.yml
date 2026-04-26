@@ -1,0 +1,71 @@
+# StayVise — Docker Compose (CI/Integration)
+# Optimized for unattended execution in GitHub Actions runners.
+
+name: stayvise_test
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_DB: stayvise
+      POSTGRES_USER: stayvise
+      POSTGRES_PASSWORD: stayvise_test_password
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U stayvise -d stayvise"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+      target: development # Use development target to include test dependencies
+    environment:
+      DATABASE_URL: postgresql+asyncpg://stayvise:stayvise_test_password@postgres:5432/stayvise
+      REDIS_URL: redis://redis:6379/0
+      ENVIRONMENT: test
+      SECRET_KEY: "test-secret-key-minimum-32-bytes-long!!"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/health')\" || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # We include worker for integration tests that rely on background tasks
+  celery_worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+      target: development
+    environment:
+      DATABASE_URL: postgresql+asyncpg://stayvise:stayvise_test_password@postgres:5432/stayvise
+      REDIS_URL: redis://redis:6379/0
+      ENVIRONMENT: test
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    command: celery -A app.worker.celery_app worker --loglevel=info
+
+  # Optional: include frontend if smoke testing requires it locally
+  # frontend:
+  #   build: ./frontend
+  #   ports:
+  #     - "5173:5173"
+  #   environment:
+  #     VITE_API_URL: http://backend:8000
