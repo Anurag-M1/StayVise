@@ -46,7 +46,7 @@ class SecureAccessService:
                 logger.info("FALLBACK (Mocked) — Link for %s: %s", email, link)
                 return True
             
-            logger.error("Failed to send secure access link email to %s: %s", email, exc)
+            logger.error("Failed to send secure access link email to %s. Error: %s", email, str(exc))
             raise
 
 secure_access_service = SecureAccessService()
