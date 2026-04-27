@@ -8,6 +8,10 @@ class SecureAccessService:
     def __init__(self):
         if settings.RESEND_API_KEY:
             resend.api_key = settings.RESEND_API_KEY
+            # Log snippet for debugging
+            key = settings.RESEND_API_KEY
+            snippet = f"{key[:5]}...{key[-4:]}" if len(key) > 10 else "too short"
+            logger.info("📧 Email service initialized with API Key: %s", snippet)
         self.enabled = bool(settings.RESEND_API_KEY)
 
     async def send_secure_access_link(self, email: str, link: str):
