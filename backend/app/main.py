@@ -171,10 +171,13 @@ def create_app() -> FastAPI:
     app.add_middleware(RateLimitMiddleware)
 
     # 3. CORS — must be early so OPTIONS pre-flights are handled
+    origins = _cors_origins()
+    allow_all = "*" in origins
+    
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=_cors_origins(),
-        allow_credentials=True,
+        allow_origins=origins,
+        allow_credentials=not allow_all,  # Cannot be True if origin is "*"
         allow_methods=["*"],
         allow_headers=["*"],
         expose_headers=["X-Request-ID", "X-Response-Time"],
