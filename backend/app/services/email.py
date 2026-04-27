@@ -6,9 +6,9 @@ logger = logging.getLogger("stayvise.email")
 
 class SecureAccessService:
     def __init__(self):
-        if settings.RESEND_API_KEY and "placeholder" not in settings.RESEND_API_KEY:
+        if settings.RESEND_API_KEY:
             resend.api_key = settings.RESEND_API_KEY
-        self.enabled = bool(settings.RESEND_API_KEY and "placeholder" not in settings.RESEND_API_KEY)
+        self.enabled = bool(settings.RESEND_API_KEY)
 
     async def send_secure_access_link(self, email: str, link: str):
         """
