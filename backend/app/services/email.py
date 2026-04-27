@@ -17,7 +17,7 @@ class SecureAccessService:
         """
         # If no key is set or it's just a placeholder, log it instead of failing
         if not self.enabled:
-            logger.info("DEV MODE (Mocked) — Secure Access Link for %s: %s", email, link)
+            logger.warning("⚠️ EMAIL MOCKED (No API Key) — Access Link for %s: %s", email, link)
             return True
 
         try:
